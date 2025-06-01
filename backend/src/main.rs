@@ -1,5 +1,4 @@
-use chrono::Utc;
-use common::WebSocketMessage;
+use common::{ChatMessage, WebSocketMessage, WebSocketMessageType};
 use rocket::futures::{stream::SplitSink, SinkExt, StreamExt};
 use rocket::tokio::sync::Mutex;
 use rocket::State;
@@ -14,29 +13,60 @@ static USER_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Default)]
 struct ChatRoom {
-    connections: Mutex<HashMap<usize, SplitSink<DuplexStream, Message>>>,
+    connections: Mutex<HashMap<usize, ChatRoomConnection>>,
+}
+
+struct ChatRoomConnection {
+    username: String,
+    sink: SplitSink<DuplexStream, Message>,
 }
 
 impl ChatRoom {
     pub async fn add(&self, id: usize, sink: SplitSink<DuplexStream, Message>) {
         let mut conns = self.connections.lock().await;
-        conns.insert(id, sink);
+        let connection = ChatRoomConnection {
+            username: format!("User #{}", id),
+            sink,
+        };
+        conns.insert(id, connection);
     }
 
-    pub async fn broadcast_message(&self, message: Message, author_id: usize) {
-        let chat_message = common::ChatMessage {
-            message: message.to_string(),
-            author: format!("User #{}", author_id),
-            created_at: Utc::now().naive_utc(),
-        };
+    pub async fn change_username(&self, new_username: String, id: usize) {
+        let mut conns = self.connections.lock().await;
+        if let Some(connection) = conns.get_mut(&id) {
+            connection.username = new_username;
+        }
+    }
+
+    pub async fn broadcast_message(&self, message: ChatMessage) {
+        let mut conns = self.connections.lock().await;
         let websocket_message = WebSocketMessage {
             message_type: common::WebSocketMessageType::NewMessage,
-            message: Some(chat_message),
+            message: Some(message),
+            username: None,
             users: None,
         };
         let mut conns = self.connections.lock().await;
-        for (_id, sink) in conns.iter_mut() {
-            let _ = sink
+        for (_id, connection) in conns.iter_mut() {
+            let _ = connection
+                .sink
+                .send(Message::Text(json!(websocket_message).to_string()))
+                .await;
+        }
+    }
+
+    pub async fn send_username(&self, id: usize) {
+        let mut conns = self.connections.lock().await;
+        if let Some(connection) = conns.get_mut(&id) {
+            let websocket_message = WebSocketMessage {
+                message_type: common::WebSocketMessageType::UsernameChange,
+                message: None,
+                username: Some(connection.username.clone()),
+                users: None,
+            };
+
+            let _ = connection
+                .sink
                 .send(Message::Text(json!(websocket_message).to_string()))
                 .await;
         }
@@ -46,18 +76,20 @@ impl ChatRoom {
         let mut conns = self.connections.lock().await;
         let mut users = vec![];
 
-        for (id, _) in conns.iter() {
-            users.push(format!("User #{}", id));
+        for (_id, connection) in conns.iter() {
+            users.push(connection.username.clone());
         }
 
         let websocket_message = WebSocketMessage {
             message_type: common::WebSocketMessageType::UsersList,
             message: None,
+            username: None,
             users: Some(users),
         };
 
-        for (_id, sink) in conns.iter_mut() {
-            let _ = sink
+        for (_id, connection) in conns.iter_mut() {
+            let _ = connection
+                .sink
                 .send(Message::Text(json!(websocket_message).to_string()))
                 .await;
         }
@@ -69,6 +101,37 @@ impl ChatRoom {
     }
 }
 
+async fn handle_incoming_message(
+    message_contents: Message,
+    state: &State<ChatRoom>,
+    connection_id: usize,
+) {
+    match message_contents {
+        Message::Text(json) => {
+            if let Ok(websocket_message) = serde_json::from_str::<WebSocketMessage>(&json) {
+                match websocket_message.message_type {
+                    WebSocketMessageType::NewMessage => {
+                        if let Some(ws_msg) = websocket_message.message {
+                            state.broadcast_message(ws_msg).await
+                        }
+                    }
+                    WebSocketMessageType::UsernameChange => {
+                        if let Some(ws_username) = websocket_message.username {
+                            state.change_username(ws_username, connection_id).await;
+                            state.send_username(connection_id).await;
+                            state.broadcast_user_list().await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {
+            // Unsupported
+        }
+    }
+}
+
 #[rocket::get("/")]
 fn chat<'r>(ws: WebSocket, state: &'r State<ChatRoom>) -> Channel<'r> {
     ws.channel(move |stream| {
@@ -77,9 +140,12 @@ fn chat<'r>(ws: WebSocket, state: &'r State<ChatRoom>) -> Channel<'r> {
             let (ws_sink, mut ws_stream) = stream.split();
             state.add(user_id, ws_sink).await;
             state.broadcast_user_list().await;
+            state.send_username(user_id).await;
 
             while let Some(message) = ws_stream.next().await {
-                state.broadcast_message(message?, user_id).await;
+                if let Ok(message_contents) = message {
+                    handle_incoming_message(message_contents, state, user_id).await;
+                }
             }
 
             state.remove(user_id).await;
